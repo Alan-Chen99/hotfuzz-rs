@@ -1,14 +1,13 @@
 use bumpalo::{
-    // boxed::Box,
     collections::{string::String, vec::Vec},
-    vec,
-    Bump,
+    vec, Bump,
 };
 use emacs::{defun, Env, Result, Value};
-use itertools::izip;
+use itertools::{chain, izip};
 use rayon::prelude::*;
 use scopeguard::guard;
-use std::cell::RefCell;
+use second_stack::buffer;
+use std::{cell::RefCell, cmp::min, iter::repeat};
 use std::{cmp, os, ptr};
 
 emacs::plugin_is_GPL_compatible!();
@@ -17,6 +16,9 @@ mod e {
     use emacs::use_symbols;
     use_symbols! {
         nil
+        t
+        encode_coding_string
+        no_conversion
     }
 }
 
@@ -50,6 +52,61 @@ fn is_match<const DOWNCASE: bool>(needle: &[u8], haystack: &[u8]) -> bool {
     true
 }
 
+fn downcase_byte_str(s: &mut [u8]) {
+    for x in s.iter_mut() {
+        *x = x.to_ascii_lowercase()
+    }
+}
+
+fn char_bonus(prev: u8, ch: u8) -> i32 {
+    let word_bonus = 80;
+
+    match ch {
+        b'A'..=b'Z' if prev.is_ascii_lowercase() => word_bonus,
+        b'A'..=b'Z' | b'a'..=b'z' => match prev {
+            b'/' => 90,
+            b'.' => 60,
+            b'-' | b'_' | b' ' => word_bonus,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn get_cost<const DOWNCASE: bool>(needle: &[u8], haystack: &mut [u8]) -> Cost {
+    if DOWNCASE {
+        downcase_byte_str(haystack);
+    }
+    let nl = needle.len();
+    if nl == 0 {
+        return 0;
+    }
+    buffer(repeat(10000 as Cost).take(nl), |c| {
+        buffer(repeat(10000 as Cost).take(nl), |d| {
+            // d: cost if ch does not match hay
+            // c: cost either way
+            // chunk penalty, incured at end of matched chunk
+            let g: Cost = 100;
+            let s_init = chain!([0], repeat(g));
+            let mut prev_hay = b'/';
+            for (&hay, s_init) in izip!(haystack.iter(), s_init) {
+                // s = c[i-1][j-1]
+                let mut s: i32 = s_init;
+                let bonus = char_bonus(prev_hay, hay);
+
+                for (&ch, c, d) in izip!(needle, c.iter_mut(), d.iter_mut()) {
+                    let oldc = *c;
+                    *d = min(*d, *c + g);
+                    *c = if hay == ch { min(*d, s - bonus) } else { *d };
+                    s = oldc;
+                }
+                prev_hay = hay;
+            }
+            min(*d.last().unwrap(), *c.last().unwrap() + g) + 5 * (haystack.len() as Cost)
+        })
+    })
+}
+
 fn calc_all_score<'b, const DOWNCASE: bool>(
     b: &'b Bump,
     str: String,
@@ -58,7 +115,7 @@ fn calc_all_score<'b, const DOWNCASE: bool>(
     let mut ans: Vec<Option<Cost>> = vec![in b; None; cands.len()];
     let mut str = str.into_bytes();
     if DOWNCASE {
-        str.iter_mut().for_each(|x| *x = x.to_ascii_lowercase());
+        downcase_byte_str(&mut str);
     }
     let needle = str.as_slice();
     let mut cands = Vec::from_iter_in(
@@ -72,7 +129,7 @@ fn calc_all_score<'b, const DOWNCASE: bool>(
         .for_each(|(cand, ans)| {
             for (haystack, ans) in izip!(cand, ans) {
                 if is_match::<DOWNCASE>(needle, haystack) {
-                    *ans = Some(haystack.len() as i32)
+                    *ans = Some(get_cost::<DOWNCASE>(needle, haystack));
                 }
             }
         });
@@ -116,8 +173,20 @@ fn filter_cands<'a>(str: Value<'a>, cands: Value<'a>) -> Result<Value<'a>> {
     })
 }
 
-// slightly modified emacs::Env::string_bytes
 fn try_into_string<'b>(v: Value, b: &'b Bump) -> Result<String<'b>> {
+    match try_into_string_utf8(v, b) {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            let env = v.env;
+            let v = e::encode_coding_string
+                .call(env, [v, e::no_conversion.bind(env), e::t.bind(env)])?;
+            try_into_string_utf8(v, b)
+        }
+    }
+}
+
+// slightly modified emacs::Env::string_bytes
+fn try_into_string_utf8<'b>(v: Value, b: &'b Bump) -> Result<String<'b>> {
     let env = v.env;
     let env_raw = env.raw();
     let mut len: isize = 0;
