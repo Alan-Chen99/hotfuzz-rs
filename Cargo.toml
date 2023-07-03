@@ -1,0 +1,15 @@
+[package]
+name = "hotfuzz-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bumpalo = { version = "3.13.0", features = ["boxed", "collections"] }
+# emacs = "0.18.0"
+emacs = { version = "0.18.0", path = "/home/alan/emacs-module-rs"}
+itertools = "0.11.0"
+rayon = "1.7.0"
+scopeguard = "1.1.0"
+
+[lib]
+crate-type = ["cdylib"]
