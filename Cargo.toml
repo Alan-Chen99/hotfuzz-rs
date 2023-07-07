@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.71"
 bumpalo = { version = "3.13.0", features = ["boxed", "collections"] }
-# emacs = "0.18.0"
 emacs = { version = "0.18.0", git = "https://github.com/Alan-Chen99/emacs-module-rs.git"}
 itertools = "0.11.0"
 rayon = "1.7.0"
@@ -18,3 +17,4 @@ crate-type = ["cdylib"]
 
 [profile.release]
 lto = true
+strip = true
