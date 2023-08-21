@@ -1,5 +1,5 @@
 mod bump_utils;
-use bump_utils::*;
+use bump_utils::{parse_to_string, BoxIntoIter};
 
 use bumpalo::{boxed::Box, collections::vec::Vec, vec, Bump};
 use emacs::{defun, Env, Result, Value};
@@ -25,6 +25,7 @@ mod e {
 type Cost = i32;
 
 #[emacs::module]
+#[allow(clippy::unnecessary_wraps)]
 fn init(_: &Env) -> Result<()> {
     Ok(())
 }
@@ -38,7 +39,7 @@ fn with_bump<T>(callback: impl FnOnce(&mut Bump) -> T) -> T {
         let b = cell.take().unwrap_or_else(Bump::new);
         let mut b = guard(b, |mut b| {
             b.reset();
-            cell.set(Some(b))
+            cell.set(Some(b));
         });
         callback(&mut b)
     })
@@ -46,7 +47,7 @@ fn with_bump<T>(callback: impl FnOnce(&mut Bump) -> T) -> T {
 
 #[defun]
 fn free_mem() -> Result<usize> {
-    BUMP.with(|cell| Ok(cell.take().map(|b| b.allocated_bytes()).unwrap_or(0)))
+    BUMP.with(|cell| Ok(cell.take().map_or(0, |b| b.allocated_bytes())))
 }
 
 struct Config {
@@ -97,7 +98,7 @@ fn get_cost(bump: &Bump, needle: &[char], mut haystack: Box<str>, cf: &Config) -
         return 0;
     }
     if cf.downcase_haystack {
-        haystack.make_ascii_lowercase()
+        haystack.make_ascii_lowercase();
     }
     // cost if ch does not match hay
     let mut d = Vec::from_iter_in(repeat(10000 as Cost).take(nl), bump);
@@ -120,7 +121,9 @@ fn get_cost(bump: &Bump, needle: &[char], mut haystack: Box<str>, cf: &Config) -
         }
         prev_hay = hay;
     }
-    min(*d.last().unwrap(), *c.last().unwrap() + g) + 5 * (haystack.len() as Cost)
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let ans = min(*d.last().unwrap(), *c.last().unwrap() + g) + 5 * (haystack.len() as Cost);
+    ans
 }
 
 fn filter_impl<'a>(
@@ -178,7 +181,7 @@ fn filter_impl<'a>(
                         }
                         bump.reset();
                     }
-                })
+                });
             }
             Ok(())
         })?;
@@ -231,14 +234,13 @@ fn try_hard_into_bytes<'b, 'v>(bump: &'b Bump, v: Value<'v>) -> Result<(Value<'v
     }
 }
 fn try_into_bytes<'b>(bump: &'b Bump, v: Value) -> Result<Vec<'b, u8>> {
-    match copy_to_bytes(bump, v) {
-        Ok(s) => Ok(s),
-        Err(_) => {
-            let env = v.env;
-            let v = e::encode_coding_string
-                .call(env, [v, e::no_conversion.bind(env), e::t.bind(env)])?;
-            copy_to_bytes(bump, v)
-        }
+    if let Ok(s) = copy_to_bytes(bump, v) {
+        Ok(s)
+    } else {
+        let env = v.env;
+        let v =
+            e::encode_coding_string.call(env, [v, e::no_conversion.bind(env), e::t.bind(env)])?;
+        copy_to_bytes(bump, v)
     }
 }
 
@@ -258,17 +260,19 @@ fn copy_to_bytes<'b>(bump: &'b Bump, v: Value) -> Result<Vec<'b, u8>> {
             env.handle_exit(false)?;
             unreachable!();
         }
-        let mut bytes = Vec::with_capacity_in(len as usize, bump);
+        #[allow(clippy::cast_sign_loss)]
+        let mut bytes = Vec::<u8>::with_capacity_in(len as usize, bump);
 
         if !copy_string_contents(
             env_raw,
             v.raw(),
-            bytes.as_mut_ptr() as *mut os::raw::c_char,
+            bytes.as_mut_ptr().cast::<os::raw::c_char>(),
             &mut len,
         ) {
             env.handle_exit(false)?;
             unreachable!();
         }
+        #[allow(clippy::cast_sign_loss)]
         let len = len as usize;
         bytes.set_len(len);
         // should always be 0 terminated

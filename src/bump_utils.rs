@@ -39,7 +39,7 @@ impl<'b, T> From<Box<'b, [T]>> for BoxIntoIter<'b, T> {
 
 impl<'b, T> Drop for BoxIntoIter<'b, T> {
     fn drop(&mut self) {
-        while let Some(_) = self.next() {}
+        for _ in self {}
     }
 }
 
@@ -53,7 +53,7 @@ impl<'b, T> Iterator for BoxIntoIter<'b, T> {
             } else {
                 let old = self.cur;
                 self.cur = self.cur.offset(1);
-                Some(Box::from_raw(old as _))
+                Some(Box::from_raw(old.cast_mut()))
             }
         }
     }
@@ -62,7 +62,10 @@ impl<'b, T> Iterator for BoxIntoIter<'b, T> {
 impl<'b, T> ExactSizeIterator for BoxIntoIter<'b, T> {
     #[inline]
     fn len(&self) -> usize {
-        unsafe { self.end.offset_from(self.cur) as usize }
+        #[allow(clippy::cast_sign_loss)]
+        unsafe {
+            self.end.offset_from(self.cur) as usize
+        }
     }
 }
 
@@ -73,11 +76,11 @@ mod tests {
     #[test]
     fn test() {
         let b = Bump::new();
-        let arr = Box::from_iter_in((0..10).map(|i| std::boxed::Box::new(i)), &b);
+        let arr = Box::from_iter_in((0..10).map(std::boxed::Box::new), &b);
         let mut iter: BoxIntoIter<_> = arr.into();
         for _ in 0..5 {
             let obj = iter.next().unwrap();
-            println!("{}", obj);
+            println!("{obj}");
         }
     }
 }
