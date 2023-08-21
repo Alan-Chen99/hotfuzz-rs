@@ -1,12 +1,12 @@
-use bumpalo::{
-    collections::{string::String, vec::Vec},
-    vec, Bump,
-};
+mod bump_utils;
+use bump_utils::*;
+
+use bumpalo::{boxed::Box, collections::vec::Vec, vec, Bump};
 use emacs::{defun, Env, Result, Value};
 use itertools::{chain, izip};
 use scopeguard::guard;
-use second_stack::buffer;
-use std::{cell::Cell, cmp, os, ptr};
+use std::cmp;
+use std::{cell::Cell, os, ptr};
 use std::{cmp::min, iter::repeat};
 
 emacs::plugin_is_GPL_compatible!();
@@ -30,7 +30,7 @@ fn init(_: &Env) -> Result<()> {
 }
 
 thread_local! {
-    pub static BUMP: Cell<Option<Bump>> = Cell::new(None);
+    static BUMP: Cell<Option<Bump>> = Cell::new(None);
 }
 
 fn with_bump<T>(callback: impl FnOnce(&mut Bump) -> T) -> T {
@@ -56,6 +56,7 @@ struct Config {
     num_threads: usize,
 }
 
+#[inline]
 fn is_match<const DOWNCASE_HAY: bool>(needle: &[char], haystack: &str) -> bool {
     let mut haystack_iter = haystack.chars();
 
@@ -75,7 +76,7 @@ fn is_match<const DOWNCASE_HAY: bool>(needle: &[char], haystack: &str) -> bool {
     true
 }
 
-fn char_bonus(prev: char, ch: char) -> i32 {
+fn char_bonus(prev: char, ch: char) -> Cost {
     let word_bonus = 80;
 
     match ch {
@@ -90,61 +91,54 @@ fn char_bonus(prev: char, ch: char) -> i32 {
     }
 }
 
-fn get_cost(needle: &[char], haystack: &str, cf: &Config) -> Cost {
+fn get_cost(bump: &Bump, needle: &[char], mut haystack: Box<str>, cf: &Config) -> Cost {
     let nl = needle.len();
     if nl == 0 {
         return 0;
     }
-    buffer(repeat(10000 as Cost).take(nl), |c| {
-        buffer(repeat(10000 as Cost).take(nl), |d| {
-            // d: cost if ch does not match hay
-            // c: cost either way
-            // chunk penalty, incured at end of matched chunk
-            let g: Cost = 100;
-            let s_init = chain!([0], repeat(g));
-            let mut prev_hay = '/';
-            for (hay, s_init) in izip!(haystack.chars(), s_init) {
-                // s = c[i-1][j-1]
-                let mut s: i32 = s_init;
-                let bonus = char_bonus(prev_hay, hay);
-                let hay_cased = if cf.downcase_haystack {
-                    hay.to_ascii_lowercase()
-                } else {
-                    hay
-                };
+    if cf.downcase_haystack {
+        haystack.make_ascii_lowercase()
+    }
+    // cost if ch does not match hay
+    let mut d = Vec::from_iter_in(repeat(10000 as Cost).take(nl), bump);
+    // cost either way
+    let mut c = Vec::from_iter_in(repeat(10000 as Cost).take(nl), bump);
+    // chunk penalty, incured at end of matched chunk
+    let g: Cost = 100;
+    let s_init = chain!([0], repeat(g));
+    let mut prev_hay = '/';
+    for (hay, s_init) in izip!(haystack.chars(), s_init) {
+        // s = c[i-1][j-1]
+        let mut s: Cost = s_init;
+        let bonus = char_bonus(prev_hay, hay);
 
-                for (&ch, c, d) in izip!(needle, c.iter_mut(), d.iter_mut()) {
-                    let oldc = *c;
-                    *d = min(*d, *c + g);
-                    *c = if hay_cased == ch {
-                        min(*d, s - bonus)
-                    } else {
-                        *d
-                    };
-                    s = oldc;
-                }
-                prev_hay = hay;
-            }
-            min(*d.last().unwrap(), *c.last().unwrap() + g) + 5 * (haystack.len() as Cost)
-        })
-    })
+        for (&ch, c, d) in izip!(needle, c.iter_mut(), d.iter_mut()) {
+            let oldc = *c;
+            *d = min(*d, *c + g);
+            *c = if hay == ch { min(*d, s - bonus) } else { *d };
+            s = oldc;
+        }
+        prev_hay = hay;
+    }
+    min(*d.last().unwrap(), *c.last().unwrap() + g) + 5 * (haystack.len() as Cost)
 }
 
 fn filter_impl<'a>(
     bump: &Bump,
     cf: &Config,
-    needle: Value<'a>,
+    needle: Value,
     mut cands: Value<'a>,
 ) -> Result<Value<'a>> {
-    let env = needle.env;
+    let env = cands.env;
 
-    let mut needle = parse_to_string(bump, try_hard_into_bytes(bump, needle)?.1.into_bump_slice());
-    if cf.downcase_needle {
-        let mut tmp = String::from_str_in(needle, bump);
-        tmp.make_ascii_lowercase();
-        needle = tmp.into_bump_str();
+    let mut needle = parse_to_string(bump, try_hard_into_bytes(bump, needle)?.1.into());
+    if needle.is_empty() {
+        return Ok(e::nil.bind(env));
     }
-    let needle = Vec::from_iter_in(needle.chars(), bump).into_bump_slice();
+    if cf.downcase_needle {
+        needle.make_ascii_lowercase();
+    }
+    let needle = Vec::from_iter_in(needle.chars(), bump).into_boxed_slice();
     let mut cands_vec: Vec<Value> = vec![in bump];
     while cands.is_not_nil() {
         let v: Value = cands.car()?;
@@ -155,7 +149,7 @@ fn filter_impl<'a>(
     rayon::ThreadPoolBuilder::new()
         .num_threads(cf.num_threads)
         .build()?
-        .in_place_scope(|s| -> Result<()> {
+        .in_place_scope(|s| -> Result<_> {
             for (chunk, ans) in izip!(
                 cands_vec.chunks_mut(cf.chunk_size),
                 costs.chunks_mut(cf.chunk_size)
@@ -164,21 +158,23 @@ fn filter_impl<'a>(
                 for v in chunk {
                     let parsed = try_hard_into_bytes(bump, *v)?;
                     *v = parsed.0;
-                    cands_str.push(parsed.1.into_bump_slice());
+                    cands_str.push(parsed.1.into_boxed_slice());
                 }
-                let cands_str = cands_str.into_bump_slice();
-                s.spawn(move |_| {
+                let cands_str = cands_str.into_boxed_slice();
+                s.spawn(|_| {
                     let mut bump = Bump::new();
                     assert!(cands_str.len() == ans.len());
-                    for (haystack, ans) in izip!(cands_str, ans) {
-                        let haystack = parse_to_string(&bump, haystack);
+                    for (haystack, ans) in izip!(BoxIntoIter::from(cands_str), ans) {
+                        let haystack = parse_to_string(&bump, Box::into_inner(haystack));
                         let matched = if cf.downcase_haystack {
-                            is_match::<true>(needle, haystack)
+                            is_match::<true>(&needle, &haystack)
                         } else {
-                            is_match::<false>(needle, haystack)
+                            is_match::<false>(&needle, &haystack)
                         };
                         if matched {
-                            *ans = Some(get_cost(needle, haystack, cf));
+                            *ans = Some(get_cost(&bump, &needle, haystack, cf));
+                        } else {
+                            drop(haystack);
                         }
                         bump.reset();
                     }
@@ -200,7 +196,7 @@ fn filter_impl<'a>(
 }
 
 #[defun(name = "filter")]
-fn filter_cands<'a>(needle: Value<'a>, cands: Value<'a>) -> Result<Value<'a>> {
+fn filter_cands<'a>(needle: Value, cands: Value<'a>) -> Result<Value<'a>> {
     with_bump(|bump| {
         filter_impl(
             bump,
@@ -262,7 +258,7 @@ fn copy_to_bytes<'b>(bump: &'b Bump, v: Value) -> Result<Vec<'b, u8>> {
             env.handle_exit(false)?;
             unreachable!();
         }
-        let mut bytes: Vec<u8> = Vec::with_capacity_in(len as usize, bump);
+        let mut bytes = Vec::with_capacity_in(len as usize, bump);
 
         if !copy_string_contents(
             env_raw,
@@ -273,15 +269,12 @@ fn copy_to_bytes<'b>(bump: &'b Bump, v: Value) -> Result<Vec<'b, u8>> {
             env.handle_exit(false)?;
             unreachable!();
         }
-
-        bytes.set_len((len - 1) as usize);
+        let len = len as usize;
+        bytes.set_len(len);
+        // should always be 0 terminated
+        assert!(bytes[len - 1] == 0);
+        // safety: should always satisfy len>0, we checked above too
+        bytes.set_len(len - 1);
         Ok(bytes)
-    }
-}
-
-fn parse_to_string<'b>(bump: &'b Bump, v: &'b [u8]) -> &'b str {
-    match std::str::from_utf8(v) {
-        Ok(s) => s,
-        Err(_) => String::from_utf8_lossy_in(v, bump).into_bump_str(),
     }
 }
