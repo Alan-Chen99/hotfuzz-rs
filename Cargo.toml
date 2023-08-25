@@ -1,5 +1,5 @@
 [package]
-name = "hotfuzz-rs"
+name = "hotfuzz-rs-module"
 version = "0.1.0"
 edition = "2021"
 
