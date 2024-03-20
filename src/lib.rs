@@ -65,7 +65,7 @@ thread_local! {
 
 fn with_bump<T>(callback: impl FnOnce(&mut Bump) -> T) -> T {
     BUMP.with(|cell| {
-        let b = cell.take().unwrap_or_else(Bump::new);
+        let b = cell.take().unwrap_or_default();
         let mut b = guard(b, |mut b| {
             b.reset();
             cell.set(Some(b));
@@ -141,10 +141,11 @@ fn get_cost(bump: &Bump, needle: &[char], haystack: &str, cf: &Config) -> Cost {
         let mut s: Cost = s_init;
         let bonus = char_bonus(prev_hay, hay);
 
+        let hay_lowercase = hay.to_ascii_lowercase();
         for (&ch, c, d) in izip!(needle, c.iter_mut(), d.iter_mut()) {
             let oldc = *c;
             *d = min(*d, *c + g);
-            let do_match = hay == ch || (ignore_case && hay == ch.to_ascii_lowercase());
+            let do_match = hay == ch || (ignore_case && hay_lowercase == ch);
             *c = if do_match { min(*d, s - bonus) } else { *d };
             s = oldc;
         }
@@ -237,12 +238,12 @@ fn get_config(env: &Env) -> Result<Config> {
 fn filter_cands<'a>(needle: Value, cands: Value<'a>) -> Result<Value<'a>> {
     let env = cands.env;
     let start_time = Instant::now();
-    let ans = with_bump(|bump| filter_impl(bump, &get_config(env)?, needle, cands));
+    let ans = with_bump(|bump| filter_impl(bump, &get_config(env)?, needle, cands))?;
     let elapsed = start_time.elapsed();
     if emacs_call!(env, e::symbol_value, e::hotfuzz_benchmark).is_ok_and(|x| x.is_not_nil()) {
         emacs_call!(env, e::message, "%s", format!("took time: {elapsed:?}"))?;
     }
-    ans
+    Ok(ans)
 }
 
 fn try_hard_into_bytes<'b, 'v>(bump: &'b Bump, v: Value<'v>) -> Result<(Value<'v>, Vec<'b, u8>)> {
@@ -284,10 +285,10 @@ fn copy_to_bytes<'b>(bump: &'b Bump, v: Value) -> Result<Vec<'b, u8>> {
     let env_raw = env.raw();
     let mut len: isize = 0;
     unsafe {
-        let copy_string_contents = (*env_raw).copy_string_contents.unwrap();
+        let copy_string_contents = (*env_raw).copy_string_contents.unwrap_unchecked();
 
         if !copy_string_contents(env_raw, v.raw(), ptr::null_mut(), &mut len) {
-            env.handle_exit(false)?;
+            env.handle_exit(())?;
             unreachable!();
         }
         #[allow(clippy::cast_sign_loss)]
@@ -299,7 +300,7 @@ fn copy_to_bytes<'b>(bump: &'b Bump, v: Value) -> Result<Vec<'b, u8>> {
             bytes.as_mut_ptr().cast::<os::raw::c_char>(),
             &mut len,
         ) {
-            env.handle_exit(false)?;
+            env.handle_exit(())?;
             unreachable!();
         }
         #[allow(clippy::cast_sign_loss)]
