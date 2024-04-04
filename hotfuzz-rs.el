@@ -15,6 +15,8 @@
   "rust implementation of hotfuzz."
   :group 'minibuffer)
 
+(defvar hotfuzz-benchmark nil)
+
 ;;;###autoload
 (define-minor-mode hotfuzz-rs-mode
   "Minor mode to eanble rust hotfuzz."
