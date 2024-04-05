@@ -11,6 +11,10 @@
 (require 'hotfuzz)
 (require 'hotfuzz-rs-module)
 
+(eval-when-compile
+  (unless (require 'hotfuzz-rs-module nil t)
+    (kill-emacs 1)))
+
 (defgroup hotfuzz-rs nil
   "rust implementation of hotfuzz."
   :group 'minibuffer)
